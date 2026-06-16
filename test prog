@@ -1,0 +1,151 @@
+import os
+os.environ['TRANSFORMERS_OFFLINE'] = '1' 
+import streamlit as st
+import fitz  # PyMuPDF
+from fpdf import FPDF
+from transformers import pipeline
+
+
+@st.cache_resource
+def load_summarizer():
+    # از مدل mt5 استفاده می‌کنیم که چندزبانه است (شامل فارسی)
+    model_name = "csebuetnlp/mT5_multilingual_XLSum"
+    return pipeline("summarization", model=model_name)
+
+
+
+def read_txt(uploaded_file) -> str:
+    data = uploaded_file.read()
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("cp1256", errors="ignore")
+
+
+def read_pdf(uploaded_file) -> str:
+    # PyMuPDF با bytes هم کار می‌کند
+    data = uploaded_file.read()
+    doc = fitz.open(stream=data, filetype="pdf")
+    text_parts = []
+    for page in doc:
+        text_parts.append(page.get_text("text"))
+    return "\n".join(text_parts).strip()
+
+
+def chunk_text(text: str, chunk_size: int = 1200):
+    # ساده: تکه‌تکه کردن بر اساس تعداد کاراکتر
+    # (بعداً می‌تونیم حرفه‌ای‌ترش کنیم: تکه‌بندی بر اساس جمله/توکن)
+    text = text.strip()
+    if not text:
+        return []
+    chunks = []
+    i = 0
+    while i < len(text):
+        chunks.append(text[i:i + chunk_size])
+        i += chunk_size
+    return chunks
+
+
+def summarize_long_text(text: str, summarizer, max_length=120, min_length=30) -> str:
+    chunks = chunk_text(text, chunk_size=1200)
+    if not chunks:
+        return ""
+
+    summaries = []
+    for ch in chunks:
+        # T5 بهتره با پیشوند کار کنه
+        prompt = "summarize: " + ch.replace("\n", " ")
+        out = summarizer(prompt, max_length=max_length, min_length=min_length, do_sample=False)
+        summaries.append(out[0]["summary_text"])
+
+    # اگر متن خیلی طولانی بود، یک بار دیگر خلاصه‌ی خلاصه‌ها
+    merged = " ".join(summaries)
+    if len(summaries) > 3:
+        out2 = summarizer("summarize: " + merged, max_length=max_length, min_length=min_length, do_sample=False)
+        return out2[0]["summary_text"]
+    return merged
+
+
+def make_pdf_bytes(title: str, original: str, summary: str) -> bytes:
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.add_page()
+
+    # فونت پیش‌فرض fpdf برای انگلیسی عالیه.
+    # اگر فارسی خواستی، باید فونت TTF فارسی اضافه کنیم (مرحله بعد).
+    pdf.set_font("Helvetica", size=14)
+    pdf.multi_cell(0, 8, title)
+
+    pdf.ln(2)
+    pdf.set_font("Helvetica", size=12)
+    pdf.multi_cell(0, 7, "SUMMARY:")
+    pdf.ln(1)
+    pdf.set_font("Helvetica", size=11)
+    pdf.multi_cell(0, 6, summary)
+
+    pdf.ln(3)
+    pdf.set_font("Helvetica", size=12)
+    pdf.multi_cell(0, 7, "ORIGINAL TEXT (preview):")
+    pdf.ln(1)
+    pdf.set_font("Helvetica", size=9)
+    preview = original[:3000]  # برای جلوگیری از خیلی بزرگ شدن PDF
+    pdf.multi_cell(0, 5, preview)
+
+    return pdf.output(dest="S").encode("latin-1")
+
+
+st.set_page_config(page_title="Offline Summarizer", layout="wide")
+st.title("Offline Document Summarizer (PDF/TXT + Paste Text)")
+
+summarizer = load_summarizer()
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("Input")
+    uploaded = st.file_uploader("Upload a file (PDF or TXT)", type=["pdf", "txt"])
+    pasted = st.text_area("Or paste text here", height=200, placeholder="Paste your text...")
+
+    input_text = ""
+
+    if uploaded is not None:
+        if uploaded.name.lower().endswith(".pdf"):
+            input_text = read_pdf(uploaded)
+        else:
+            input_text = read_txt(uploaded)
+
+    if pasted.strip():
+        input_text = pasted.strip()
+
+    st.caption("Detected text preview:")
+    st.text_area("Text", value=input_text[:8000], height=300)
+
+with col2:
+    st.subheader("Summarization")
+    max_len = st.slider("Max summary length", 40, 200, 120)
+    min_len = st.slider("Min summary length", 10, 120, 30)
+
+    if st.button("Generate Summary", type="primary"):
+        if not input_text.strip():
+            st.error("No text provided. Upload a file or paste text.")
+        else:
+            with st.spinner("Summarizing..."):
+                summary = summarize_long_text(input_text, summarizer, max_length=max_len, min_length=min_len)
+
+            st.success("Done.")
+            st.text_area("Summary", value=summary, height=250)
+
+            pdf_bytes = make_pdf_bytes(
+                title="Offline Summarizer Report",
+                original=input_text,
+                summary=summary
+            )
+            st.download_button(
+                label="Download summary as PDF",
+                data=pdf_bytes,
+                file_name="summary_report.pdf",
+                mime="application/pdf"
+            )
+
+st.markdown("---")
+st.caption("Runs locally. No external API calls. Model downloads once and then works offline.")
